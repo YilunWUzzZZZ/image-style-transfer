@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Nov  4 21:53:07 2017
+
+@author: wuyilun
+"""
+
+import torch
+import torch.nn as nn
+from torch.autograd import Variable
+import torch.optim as optim
+from PIL import Image
+import matplotlib.pyplot as plt
+
+from torchvision import transforms , models
+import copy
+
+use_cuda = torch.cuda.is_available()
+
+dtype = torch.cuda.FloatTensor if use_cuda else torch.FloatTensor
+
+imsize = 512
+loader = transforms.Compose([transforms.ToTensor(),
+                            transforms.Scale(imsize)])
+
+def image_loader(path):
+    image = Image.open(path)
+    image = Variable(loader(image))
+    image = image.unsqueeze(0)
+    return image
+
+style_image = image_loader().type(dtype)
+content_image = image_loader().type(dtype)
+
+assert style_image.size() == content_image.size()
+
+plt.ion()
+
+def imshow(tensor , title = None):
+    image = tensor.clone().cpu()
+    image = image.view(3,imsize,imsize)
+    image = transforms.ToPILImage(image)
+    plt.imshow(image)
+    if title is not None:
+        plt.title(title)
+    plt.pause(0.001)
+    
+plt.figure()
+imshow(style_image , 'Style Image')
+plt.figure()
+imshow(content_image , 'Content Image')
+
+class ContentLoss(nn.Module):
+    def __init__(self , content , weight):
+        super(ContentLoss,self).__init__()
+        self.target = target.detach()
+        self.weight = weight
+        self.criterion = nn.MSELoss()
+        
+    def forward(self , x ):
+        self.loss = self.weight * self.criterion(x , self.target)
+        return x
+    
+    def backward(self , retain_graph = True):
+        self.loss.backward(retain_graph = retain_graph)
+        return self.loss
+
+def GramMatrix(fm):
+    a ,b , c , d = fm.size()
+    features = fm.view(a*b.c*d)
+    G = torch.mm(features , features.t())
+    return G.div(a*b*c*d)
+
+class StyleLoss(nn.Module):
+    
+    def __init__(self,style,weight):
+        super(StyleLoss , self).__init__()
+        self.target = style.detach()
+        self.weight = weight
+        self.criterion = nn.MSELoss()
+        
+    def forward(self,x):
+        self.G = GramMatrix(x)
+        self.loss = self.weight * self.criterion(self.G,self.target)/5
+        return x
+    
+    def backward(self , retain_graph = True):
+        self.loss.backward(retain_graph = True)
+        return self.loss()
+        
+
+state_path = ' '
+cnn = models.vgg19()
+cnn.load_state_dict('')
+cnn = cnn.features
+
+if use_cuda:
+    cnn = cnn.cuda()
+    
+for param in cnn.parameters():
+    param.requires_grad = False
+    
+content_layers_de= ['conv4_2']
+style_layers_de= ['conv1_1','conv2_1','conv3_1','conv4_1','conv5_1']
+
+def get_model_and_losses(cnn , style ,content,style_w,content_w,content_layers = content_layers_de , style_layers = style_layers_de):
+    
+    cnn = copy.deepcopy(cnn)
+    
+    content_losses = []
+    style_losses = []
+    model = nn.Sequential()
+    if use_cuda:
+        model = model.cuda()
+    i=1 
+    j=1
+    for layer in list(cnn):
+        if isinstance(layer , nn.Conv2d):
+            name = 'conv'+str(i)+'_'+str(j)
+            model.add_module(name ,layer)
+            j =j+1
+            
+            if name in content_layers:
+                content_f = model(content)
+                contentloss = ContentLoss(content_f,content_w)
+                model.add_module('ContentLoss',contentloss)
+                content_losses.append(contentloss)
+
+            if name in style_layers :
+                style_f = model(style)
+                styleloss = StyleLoss(style_f,style_w)
+                name_l = 'StyleLoss' + str(i)
+                model.add_module(name_l,styleloss)
+                style_losses.append(styleloss)
+                
+        if isinstance(layer , nn.MaxPool2d):
+            
+            name = 'MaxPool2d'+'_'+str(i)
+            i=i+1
+            j=1
+            model.add_module(name , layer)
+        
+        
+        if isinstance(layer , nn.ReLU):
+            name ='ReLU'+'_'+str(i)
+            model.add_module(name ,layer)
+    
+    return model , content_losses , style_losses
+
+
+    
+input_im =  Variable(torch.randn(content_image.data.size())).type(dtype)
+
+def get_input_param_opt(input_img):
+    input_param = nn.parameter(input_img)
+    optimizer = optim.LBFGS([input_param])
+    return input_param , optimizer
+
+
+def run_style_transfer(cnn ,input_img , style ,content ,style_w , content_w ,num_step = 300):
+    
+    print("Building model...")
+    
+    model ,content_losses ,style_losses = get_model_and_losses(cnn,style,content,style_w,content_w)
+
+    input_param ,optimizer = get_input_param_opt(input_img)
+    
+    print("optimizing")
+    
+    epoch = [1]
+    
+    while epoch <=num_step:
+        def closure():
+            input_param.data.clamp_(0,1)
+            
+            optimizer.zero_grad()
+            model(input_param)
+            style_score = 0
+            content_score = 0
+            for sl in style_losses:
+                 style_score += sl.backward()
+            
+            for cl in content_losses:
+                content_score += cl.backward()
+            
+            epoch[0] += 1
+            
+            if epoch[0] % 50 == 0:
+                print("epoch {}:".format(epoch[0]))
+                print('Style Loss : {:4f} Content Loss: {:4f}'.format(
+                    style_score.data[0], content_score.data[0]))
+                print()
+    
+            return style_score + content_score
+        
+        optimizer.step(closure)
+
+    # a last correction...
+    input_param.data.clamp_(0, 1)
+
+    return input_param.data
+    
+
+output = run_style_transfer(cnn , input_im, style_image ,content_image ,1000 ,1)
+
+plt.figure()
+imshow(output, title='Output Image')
+
+# sphinx_gallery_thumbnail_number = 4
+plt.ioff()
+plt.show()
+    
